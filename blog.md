@@ -1,6 +1,6 @@
 # Flash Attention 2 in CuteDSL: A Naive Kernel, Three Optimizations, and Where I Got Stuck
 
-After writing [Flash Attention 1](https://www.lowlevelml.com/blog/flash-attention-1) in plain CUDA, I wanted to take the next step and port Flash Attention 2 to **CuteDSL**, the Python front-end NVIDIA ships with CUTLASS 4. CuteDSL is new, under-documented, and surprisingly fun once you wrap your head around it. The catch is that I am not someone who writes kernels everyday, and I still super dumb when it comes to hardware knowledge and also I am not expert in CuteDSL either, so the almighty (claude obivously) has helped me a lot throughout my journey of trying to implement this and spent hours with me debugging when I wasn't to figure out things.
+After writing [Flash Attention 1](https://www.lowlevelml.com/blog/flash-attention-1) in plain CUDA, I wanted to take the next step and port Flash Attention 2 to **CuteDSL**, the Python front-end NVIDIA ships with CUTLASS 4. CuteDSL is new, under-documented, and surprisingly fun once you wrap your head around it. I do not write kernels every day, and I'm still building intuition for both GPU hardware and CuteDSL itself, so this project involved a lot of iteration, debugging, and help from Claude along the way.
 
 Spoiler: I did not beat PyTorch SDPA. I got close, and along the way I learned a lot about where my mental model of GPU optimization was wrong. The failed optimizations are in here too, because those were the ones I actually learned from.
 
