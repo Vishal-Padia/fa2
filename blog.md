@@ -591,7 +591,7 @@ Final table:
 | PyTorch SDPA            | 0.207 ms  | 41.55   | 1.00x        |
 
 
-We got from 2x slower to 1.30x slower. Not bad for a weekend project, and frankly I was not going to beat SDPA. PyTorch's SDPA on sm_86 dispatches to Flash Attention 2 underneath, with code tuned by people who have forgotten more about CuTe than I currently know. The remaining 1.30x is, I think, a mix of:
+We got from 2x slower to 1.30x slower. Not bad for a someone who still trying to figure out things, and frankly I was not going to beat SDPA. PyTorch's SDPA on sm_86 dispatches to Flash Attention 2 underneath, with code tuned by people who have forgotten more about CuTe than I currently know. The remaining 1.30x is, I think, a mix of:
 
 - **My tile shapes aren't ideal.** BLOCK_Q=64, BLOCK_KV=64 is a safe choice, but larger tiles amortize the prologue and expose more parallelism per block. I'd want to sweep at least `{64, 128} x {64, 128}` and probably push BLOCK_KV up.
 - **I never got pipelining to work.** That's real throughput left on the table, and it's what the "89% no eligible" -> "35%" improvement hinted at. Getting to 10% or lower requires actual overlap of cp.async with MMA.
