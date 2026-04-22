@@ -1,6 +1,10 @@
-# Flash Attention 2 in CuteDSL: A Naive Kernel and What the Profiler Thinks of It
+# Flash Attention 2 in CuteDSL: A Naive Kernel, Three Optimizations, and Where I Got Stuck
 
-After writing [Flash Attention 1](https://www.lowlevelml.com/blog/flash-attention-1) in plain CUDA, I wanted to take the next step and port Flash Attention 2 to **CuteDSL**, the Python front-end NVIDIA ships with CUTLASS 4. CuteDSL is new, under-documented, and surprisingly fun once you wrap your head around it. The catch is that almost no end-to-end FA2 write-ups exist for it, so a lot of this post is me learning the abstractions on the page, hopefully so you don't have to learn them twice.
+After writing [Flash Attention 1](https://www.lowlevelml.com/blog/flash-attention-1) in plain CUDA, I wanted to take the next step and port Flash Attention 2 to **CuteDSL**, the Python front-end NVIDIA ships with CUTLASS 4. CuteDSL is new, under-documented, and surprisingly fun once you wrap your head around it. The catch is that I am not someone who writes kernels everyday, and I still super dumb when it comes to hardware knowledge and also I am not expert in CuteDSL either, so the almighty (claude obivously) has helped me a lot throughout my journey of trying to implement this and spent hours with me debugging when I wasn't to figure out things.
+
+Spoiler: I did not beat PyTorch SDPA. I got close, and along the way I learned a lot about where my mental model of GPU optimization was wrong. The failed optimizations are in here too, because those were the ones I actually learned from.
+
+> 💡 **Thanks** to [Sriram](https://x.com/s_gowindone) for getting me into GPU work in the first place and patiently unblocking me whenever something made no sense, [GPU Mode](https://x.com/GPU_MODE) for the lectures and the community that makes kernels feel approachable, and [Gau Nernst](https://x.com/gaunernst), whose [FA on the 5090 post](https://gau-nernst.github.io/fa-5090/) was the one which gave me an idea to try this out. So a huge thanks to everyone
 
 What we'll do in this post:
 
@@ -8,22 +12,24 @@ What we'll do in this post:
 2. Write the algorithm in PyTorch so the math is unambiguous.
 3. Translate it to a naive CuteDSL kernel, explaining CuteDSL's `TiledCopy`, `TiledMMA`, and partition abstractions as we go.
 4. Profile it with Nsight Compute.
-5. Read the profile honestly and pick what to optimize next.
-
-I haven't done the optimization work yet. Once I do, I'll come back and extend this post with the numbers and the changes that got us there. For now, think of this as "the baseline is in, here's what's wrong with it."
+5. Walk through the three optimizations I tried: shared-memory pipelining (which didn't help), swizzling (which did), and `ldmatrix` (which did).
+6. Look at the final gap vs SDPA and be honest about why it's still there.
 
 > 💡 This post assumes you're comfortable with CUDA matmul, shared-memory tiling, and Tensor Cores. If "mma.m16n8k16", "warp", or "bank conflict" mean nothing to you, the [FA1 post](https://www.lowlevelml.com/blog/flash-attention-1) is a gentler on-ramp.
 
-A running table for the optimizations, to be filled in as they land:
+The running perf table:
 
-| Version         | 1024×1024, B=2, N=8, H=128 | vs SDPA          | Key change                  |
-|-----------------|----------------------------|------------------|-----------------------------|
-| Naive CuteDSL   | **0.417 ms**               | **2.02× slower** | baseline, this post         |
-| + Swizzle       | ???                        | ???              | kill bank conflicts         |
-| + Pipeline      | ???                        | ???              | overlap cp.async with MMA   |
-| + Split-K warps | ???                        | ???              | fix occupancy               |
 
-Benchmarked on an A10G (sm_86), fp16 inputs, fp32 accumulator, PyTorch SDPA as the reference.
+| Version                  | 1024x1024, B=2, N=8, H=128 | TFLOP/s   | vs SDPA          | Key change                                          |
+| ------------------------ | -------------------------- | --------- | ---------------- | --------------------------------------------------- |
+| Naive CuteDSL            | 0.417 ms                   | 20.61     | 2.02x slower     | baseline                                            |
+| + Pipelining             | 0.352 ms                   | 24.41     | 1.70x slower     | double-buffer K so cp.async overlaps MMA (broken V) |
+| + Swizzle (no pipeline)  | 0.308 ms                   | 27.93     | 1.48x slower     | swizzled smem layout, kills bank conflicts          |
+| + LDMatrix (on swizzle)  | **0.268 ms**               | **32.01** | **1.30x slower** | actual `ldmatrix.sync` instead of generic smem copy |
+| PyTorch SDPA (reference) | 0.207 ms                   | 41.55     | 1.00x            |                                                     |
+
+
+Benchmarked on an A10G (sm_86), fp16 inputs, fp32 accumulator.
 
 ---
 
@@ -31,19 +37,17 @@ Benchmarked on an A10G (sm_86), fp16 inputs, fp32 accumulator, PyTorch SDPA as t
 
 Flash Attention is an algorithmic trick that computes exact attention in a single fused kernel, streaming over `KV` tiles while keeping everything resident in on-chip memory. The original FA1 paper (Tri Dao, [arXiv:2205.14135](https://arxiv.org/abs/2205.14135)) made attention IO-bound rather than FLOP-bound, which is why it was 2 to 4x faster than a naive `softmax(QK^T)V`. FA2 ([Dao 2023, arXiv:2307.08691](https://arxiv.org/abs/2307.08691)) keeps the same math and just rearranges the work.
 
-If you're new to the family, the one-paragraph summary is: instead of materializing the full `S = QK^T` matrix (which is quadratic in sequence length and blows up HBM), you iterate over blocks of `K` and `V`, maintain an **online softmax** (a running max and normalizer), and accumulate into the output tile as you go. Never see the full attention matrix, never write it to HBM, done.
+If you're new to the family, the one-paragraph summary: instead of materializing the full `S = QK^T` matrix (which is quadratic in sequence length and blows up HBM), you iterate over blocks of `K` and `V`, maintain an **online softmax** (a running max and normalizer), and accumulate into the output tile as you go. Never see the full attention matrix, never write it to HBM, done.
 
 ## 2. What FA2 Improved Over FA1
 
 Three things, in decreasing order of how much they matter for our kernel:
 
 1. **Swap the loop order.** FA1 has the outer loop over `KV` tiles and the inner loop over `Q` tiles. FA2 flips this: outer loop is `Q`, inner loop is `KV`. That means each threadblock owns one `Q` tile and streams all of `KV` through it. The `Q` tile is loaded into shared memory *once*, and the output accumulator `O` stays in registers for the whole inner loop. No shared-memory reduction across threadblocks.
-
-2. **Defer the softmax normalization.** FA1 rescaled the output every inner iteration (`O_i *= exp(m_old - m_new)`) and divided by the running sum `l_i`. FA2 still does the rescale on max-updates, but defers the **final division by `l`** to the very end. One division per row per kernel call, not per iteration.
-
+2. **Defer the softmax normalization.** FA1 rescaled the output every inner iteration and divided by the running sum `l_i`. FA2 still does the rescale on max-updates, but defers the **final division by `l`** to the very end. One division per row per kernel call, not per iteration.
 3. **Better warp partitioning.** FA1 split work across warps along the `K` dimension, which forced a reduction through shared memory. FA2 splits along the `Q` dimension, so each warp owns an independent slice of rows with no cross-warp communication during the inner loop.
 
-For this post we care mostly about (1) and (2). (3) lives inside the `TiledMMA` configuration and we'll set it up but not really explain it in depth until we come back to this for the optimization pass.
+For this post we care mostly about (1) and (2). (3) lives inside the `TiledMMA` configuration and we'll set it up but not really talk about it.
 
 ---
 
@@ -99,11 +103,11 @@ def flash_attn_v2(Q, K, V, BLOCK_Q=64, BLOCK_KV=64):
 
 A few things worth calling out, because they map 1:1 onto what the CuteDSL kernel has to do per-thread:
 
-- `m` is the running row max. Every time we see a larger score, we need to rescale everything we've accumulated so far by `exp(m_old - m_new)`. This is the only reason the loop needs any state between iterations. Without the max-tracking, we could reorder the iterations freely.
+- `m` is the running row max. Every time we see a larger score, we need to rescale everything we've accumulated so far by `exp(m_old - m_new)`. This is the only reason the loop needs any state between iterations.
 - `l` is the running denominator. It accumulates `sum(exp(S - m))` but with the same rescaling as `O_tile`, so it stays consistent.
 - The final `O / l` is applied **once**, outside the inner loop. In FA1 it happened inside. In the CuteDSL kernel this turns into a per-row divide right before the output store.
 
-> 💡 If you want to gut-check the correctness of the rescaling trick: at any point in the loop, `O_tile_i / l_i == softmax(QK^T[:, :kv_end]) @ V[:kv_end]`. The online update keeps this invariant as new `KV` tiles arrive, which is why the final result is exact (not approximate).
+> 💡 Gut-check for the rescaling trick: at any point in the loop, `O_tile_i / l_i == softmax(QK^T[:, :kv_end]) @ V[:kv_end]`. The online update keeps this invariant as new `KV` tiles arrive, which is why the final result is exact, not approximate.
 
 Run this against `F.scaled_dot_product_attention` and it matches to `atol=1e-5`. Now we replicate it on a GPU.
 
@@ -111,21 +115,19 @@ Run this against `F.scaled_dot_product_attention` and it matches to `atol=1e-5`.
 
 ## 4. The Naive CuteDSL Kernel
 
-This is the section I wish existed when I started. CuteDSL's docs assume you already grok [CuTe's C++ layout algebra](https://github.com/NVIDIA/cutlass/blob/main/media/docs/cpp/cute/00_quickstart.md), and most online examples are either trivial (elementwise copies) or so heavily templated that it's hard to see the forest. So I'll introduce each abstraction the first time we reach for it.
-
-The full file is [`fa2_naive_cutedsl.py`](./fa2_naive_cutedsl.py). I'll walk through it in the order the kernel executes, not the order it appears in the file.
+This is the section I wish existed when I started. CuteDSL's docs assume you already grok [CuTe's C++ layout algebra](https://github.com/NVIDIA/cutlass/blob/main/media/docs/cpp/cute/00_quickstart.md), and most online examples are either trivial elementwise copies or so heavily templated that it's hard to see the forest. So I'll introduce each abstraction the first time we reach for it.
 
 ### 4.1 The tiling plan
 
 One threadblock per `(batch, head, q_tile)`. Each block:
 
-1. Loads its `Q` tile from HBM into shared memory (once, stays there).
+1. Loads its `Q` tile from HBM into shared memory once.
 2. Loops over all `KV` tiles. For each:
-   - Async-copy `K` into shared memory.
-   - Compute `S = Q @ K^T` into register-resident fp32 accumulators.
-   - Scale by `1/√D`, update the online softmax, rescale `O_accum`.
-   - Async-copy `V` into shared memory.
-   - Compute `O += P @ V` where `P = softmax(S)` cast back to fp16.
+  - Async-copy `K` into shared memory.
+  - Compute `S = Q @ K^T` into register-resident fp32 accumulators.
+  - Scale by `1/√D`, update the online softmax, rescale `O_accum`.
+  - Async-copy `V` into shared memory.
+  - Compute `O += P @ V` where `P = softmax(S)` cast back to fp16.
 3. Divide `O` by the running sum `l`, cast to fp16, store back to HBM.
 
 Concretely:
@@ -137,9 +139,9 @@ HEAD_DIM = 128
 NUM_THREADS = 128  # 4 warps per block
 ```
 
-Grid is `(ceil(Sq / BLOCK_Q), batch, num_heads)`. For a `B=2, N=8, Sq=1024` run that's `(16, 2, 8) = 256` blocks, plenty to fill an A10G's 80 SMs (3.2 waves). Good, we'll come back to this in the profile.
+Grid is `(ceil(Sq / BLOCK_Q), batch, num_heads)`. For a `B=2, N=8, Sq=1024` run that's `(16, 2, 8) = 256` blocks, plenty to fill an A10G's 80 SMs.
 
-> 💡 The mental picture: one threadblock is a horizontal band of `BLOCK_Q` rows. It sits still. The `KV` tiles slide left-to-right through it, and the block accumulates `O` in registers the whole time. That picture is the entire FA2 outer-loop schedule.
+> 💡 Mental picture: one threadblock is a horizontal band of `BLOCK_Q` rows. It sits still. The `KV` tiles slide left-to-right through it, and the block accumulates `O` in registers the whole time. That picture is the entire FA2 outer-loop schedule.
 
 ### 4.2 Shared-memory layouts
 
@@ -152,7 +154,7 @@ sQ_layout = cute.make_layout(
 )
 ```
 
-That's all, no swizzling yet. Just plain row-major. The upside is it's trivial to reason about. The downside is that several threads in a warp will hit the same shared-memory bank on `ldmatrix`, which we'll see in the profile.
+That's all, no swizzling yet. Just plain row-major. The upside is it's trivial to reason about. The downside is that several threads in a warp will hit the same shared-memory bank, which we'll see in the profile.
 
 The shared-memory **struct** is how CuteDSL lets you carve up dynamic shared memory into named regions:
 
@@ -164,13 +166,13 @@ class SharedStorage:
     sV: cute.struct.MemRange[mQ.element_type, BLOCK_KV * HEAD_DIM]
 ```
 
-For a naive kernel I gave `sQ`, `sK`, `sV` their own regions. A smarter version would alias `sV` with `sQ` (once we've used `Q` we don't touch it until the next block launches) to shave ~16KB per block and improve occupancy. That's on the list for the optimization pass.
+For the naive kernel, `sQ`, `sK`, and `sV` get their own regions.
 
 ### 4.3 `TiledCopy`: the global-to-shared copy
 
 The first abstraction that really earns its keep is `TiledCopy`. It's CuteDSL's way of saying: *I have a tile of global memory, I have a tile of shared memory, and I have `N` threads. Figure out which thread copies which element, using which hardware instruction, vectorized however it wants.*
 
-You build one in three steps. First, pick the hardware primitive. Here, Ampere's `cp.async` streaming 128-bit chunks directly from L2 to shared memory, bypassing the register file:
+Three steps. First, pick the hardware primitive. Here, Ampere's `cp.async` streaming 128-bit chunks directly from L2 to shared memory, bypassing the register file:
 
 ```python
 cp_atom = cute.make_copy_atom(
@@ -180,7 +182,7 @@ cp_atom = cute.make_copy_atom(
 )
 ```
 
-Second, describe how threads are laid out across the tile. With 128 threads and a `(64, 128)` tile where each thread moves 8 elements wide, you get a `(8, 16)` thread grid. That's 16 threads per row, 8 rows of threads, each row covering all 128 head-dim elements:
+Second, describe how threads are laid out across the tile:
 
 ```python
 elems_per_copy = 128 // mQ.element_type.width  # 8 for fp16
@@ -199,13 +201,13 @@ gmem_tiled_copy = cute.make_tiled_copy_tv(cp_atom, tQKV_layout, vQKV_layout)
 
 Now `gmem_tiled_copy` knows everything: which warp, which thread, which byte, what instruction. When we call `cute.copy(gmem_tiled_copy, src, dst)`, it expands into the right `cp.async` issues with no further work from us.
 
-> 💡 The mental model: a `TiledCopy` is a compiled plan for moving a tile. You build it once outside the kernel, and inside the kernel you slice it per-thread using `get_slice(tidx)` to get exactly *this* thread's view.
+> 💡 Mental model: a `TiledCopy` is a compiled plan for moving a tile. You build it once outside the kernel, and inside the kernel you slice it per-thread using `get_slice(tidx)` to get exactly *this* thread's view.
 
 ### 4.4 `TiledMMA`: the Tensor Core plan
 
 Same idea, for the MMA pipeline. Ampere's `mma.m16n8k16` takes a 16x16 `A` tile, an 8x16 `B` tile, and accumulates into a 16x8 fp32 `D`. One warp issues it, and each lane holds 4 fragments of `A`, 2 of `B`, and 4 of `D`.
 
-`TiledMMA` lets us tile that up across our 4 warps:
+`TiledMMA` tiles that up across our 4 warps:
 
 ```python
 tiled_mma = cute.make_tiled_mma(
@@ -215,22 +217,22 @@ tiled_mma = cute.make_tiled_mma(
 )
 ```
 
-Read this as: "4 warps, stacked along the `M` dimension, so each warp covers 16 rows, 64 rows total per issue, which is exactly `BLOCK_Q`." FA2's warp-split-along-`M` (point 3 in section 2) is literally this line.
+Read this as: "4 warps, stacked along `M`, so each warp covers 16 rows, 64 rows total per issue, which is exactly `BLOCK_Q`." FA2's warp-split-along-`M` is literally this line.
 
 ### 4.5 Partitioning: turning tiles into per-thread fragments
 
-Both `TiledCopy` and `TiledMMA` have `get_slice(tidx).partition_*` methods that take a tile and return *this thread's view* of it. There are three you see constantly:
+Both `TiledCopy` and `TiledMMA` have `get_slice(tidx).partition_*` methods that take a tile and return *this thread's view* of it. Three you see constantly:
 
-- `partition_S(tile)`, source view, for loads
-- `partition_D(tile)`, destination view, for stores
+- `partition_S(tile)`, source view for loads
+- `partition_D(tile)`, destination view for stores
 - `partition_A(tile)` / `partition_B(tile)` / `partition_C(tile)`, MMA operand views
 
-For example, here's how we set up the global to shared copy of `Q`:
+Here's how we set up the global to shared copy of `Q`:
 
 ```python
 gmem_thr_copy = gmem_tiled_copy.get_slice(tidx)
-tQgQ = gmem_thr_copy.partition_S(gQ)  # this thread's source elements in gmem Q
-tQsQ = gmem_thr_copy.partition_D(sQ)  # where they go in smem
+tQgQ = gmem_thr_copy.partition_S(gQ)  # this thread's source in gmem Q
+tQsQ = gmem_thr_copy.partition_D(sQ)  # where it goes in smem
 
 cute.copy(gmem_tiled_copy, tQgQ, tQsQ)  # issue cp.async
 cute.arch.cp_async_commit_group()
@@ -260,7 +262,7 @@ for kv in range(num_kv_tiles):
         cute.copy(smem_tiled_copy_K, tSsK[None, None, k], tSrK_copy_view[None, None, k])
         cute.gemm(tiled_mma, acc_S, tSrQ[None, None, k], tSrK[None, None, k], acc_S)
 
-    # scale + online softmax update (see below)
+    # scale + online softmax update
     ...
 
     # load V into smem
@@ -277,27 +279,24 @@ for kv in range(num_kv_tiles):
 
 Two things are worth noting even at this naive stage:
 
-1. **Every copy is followed by a full `cp_async_wait_group(0)` and `sync_threads()`.** This means no overlap: the MMA waits for the copy, then the copy waits for the MMA. This is the single biggest reason the naive kernel is slow, there's no pipelining. When I come back to optimize, the first fix will be a double-buffered prologue so `K[kv+1]` starts arriving while we MMA on `K[kv]`.
-
-2. **`V` has to be transposed for the second GEMM.** The MMA wants the `B` operand column-major, but we stored `V` row-major. We cheat:
-
-   ```python
+1. **Every copy is followed by a full `cp_async_wait_group(0)` and `sync_threads()`.** No overlap, the MMA waits for the copy, then the copy waits for the MMA. This will be the target of the pipelining attempt.
+2. `**V` has to be transposed for the second GEMM.** The MMA wants the `B` operand column-major, but we stored `V` row-major. We cheat:
+  ```python
    sVt = cute.make_tensor(
        sV.iterator,
        cute.make_layout((HEAD_DIM, BLOCK_KV), stride=(1, HEAD_DIM)),
    )
-   ```
-
-   Same underlying buffer, swapped shape and stride. No data movement, just a relabelling. The cost shows up later as bank conflicts on the `ldmatrix`, because the access pattern is now fighting the row-major smem layout. The proper fix is a swizzled layout. For now we eat the conflict.
+  ```
+   Same underlying buffer, swapped shape and stride. No data movement, just a relabelling.
 
 ### 4.7 The online softmax, per-thread
 
-Inside the inner loop, after computing `S`, we do the FA2 update. This is the part that looked clean in PyTorch and turns into a nest of scalar loops here, because each thread owns only a **fragment** of `S`. A handful of rows and columns scattered across the 32x8 lane grid of the MMA.
+Inside the inner loop, after computing `S`, we do the FA2 update. This is the part that looked clean in PyTorch and turns into a nest of scalar loops here, because each thread owns only a **fragment** of `S`: a handful of rows and columns scattered across the 32x8 lane grid of the MMA.
 
 ```python
 for row in cutlass.range_constexpr(cute.size(row_max)):
-    mi = row % m_atom  # intra-atom row index
-    mt = row // m_atom  # which M-tile
+    mi = row % m_atom
+    mt = row // m_atom
 
     # 1. row max over this thread's columns
     tile_max = -cutlass.Float32.inf
@@ -328,9 +327,7 @@ for row in cutlass.range_constexpr(cute.size(row_max)):
     row_max[row] = new_rowmax
 ```
 
-The butterfly shuffles (`shuffle_sync_bfly`, offsets 2 and 1) are the key detail. `mma.m16n8k16` lays out each output row across **4 lanes** (lanes `(0,1,2,3)`, `(4,5,6,7)`, and so on). To get the true row max, each lane needs to see the partial maxes from the other three. Two butterfly shuffles do exactly that. No shared memory, no `__syncthreads()`, just 2 warp-level instructions. This is the single cleanest example of why FA2's warp-split-along-`M` matters: a split along `K` would need a cross-warp reduction here, which is orders of magnitude more expensive.
-
-After the KV loop, one more quad-reduce on `row_sum`, divide, and store. The epilogue is a tiny `ldmatrix`-style staging through shared memory before the final gmem write (we're on Ampere, so no TMA).
+The butterfly shuffles are the key detail. `mma.m16n8k16` lays out each output row across **4 lanes** (lanes `(0,1,2,3)`, `(4,5,6,7)`, and so on). To get the true row max, each lane needs to see the partial maxes from the other three. Two butterfly shuffles do exactly that. No shared memory, no sync, just 2 warp-level instructions. This is the single cleanest example of why FA2's warp-split-along-`M` matters: a split along `K` would need a cross-warp reduction here, which is orders of magnitude more expensive.
 
 ### 4.8 Correctness
 
@@ -345,11 +342,11 @@ CORRECTNESS CHECK  (B=2, N=8, Sq=1024, Sk=1024, H=128)
   VERDICT: PASS ✓
 ```
 
-Max abs error of `2.4e-4` is normal for fp16 accumulated through softmax, and cosine sim of 1.0 to the eye means we match SDPA row-for-row. Good, the algorithm works. Now: how fast is it?
+Max abs error of `2.4e-4` is normal for fp16 accumulated through softmax, and cosine sim of 1.0 means we match SDPA row-for-row. The algorithm works. Now: how fast is it?
 
 ---
 
-## 5. Profiling with Nsight Compute
+## 5. Profiling the Naive Kernel
 
 I profiled with:
 
@@ -359,7 +356,7 @@ ncu --set full --target-processes all \
     .venv/bin/python fa2_naive_cutedsl.py
 ```
 
-Raw timing first:
+Raw timing:
 
 ```
 TIMING  (1024x1024, B=2, N=8, H=128)
@@ -372,11 +369,9 @@ PyTorch SDPA
   Ours vs SDPA: 2.02x slower
 ```
 
-We're at half of SDPA. Not catastrophic for a v1, but not good. The interesting question is *why*. ncu's `--set full` output is huge, so I'll pull out the damning bits.
+Half of SDPA. Not catastrophic for a v1, but not good. The interesting question is *why*.
 
-### 5.1 Speed-of-light summary
-
-For the FA2 kernel on the small test (B=2, N=4, Sq=256 - 32 blocks, grid is tiny but the per-kernel metrics scale):
+### 5.1 Speed of light
 
 ```
 Section: GPU Speed Of Light Throughput
@@ -387,115 +382,233 @@ Section: GPU Speed Of Light Throughput
     Compute (SM) Throughput        9.93 %
 ```
 
-Both compute and memory are well below peak. This almost always means **latency-bound**: the SMs have work queued but they're waiting on something. ncu even calls it out:
+Both compute and memory are well below peak, which almost always means **latency-bound**. The SMs have work queued, they're waiting on something. ncu even calls it out:
 
 ```
 OPT   This workload exhibits low compute throughput and memory bandwidth
       utilization relative to the peak performance of this device.
       Achieved compute throughput and/or memory bandwidth below 60.0% of peak
-      typically indicate latency issues. Look at Scheduler Statistics and
-      Warp State Statistics for potential reasons.
+      typically indicate latency issues.
 ```
 
-### 5.2 Scheduler and warp state, the smoking gun
+### 5.2 The smoking gun
 
 ```
 Section: Scheduler Statistics
     One or More Eligible                 10.96 %
     Issued Warp Per Scheduler             0.11
     No Eligible                          89.04 %
-    Active Warps Per Scheduler            1.00 warp
-    Eligible Warps Per Scheduler          0.11 warp
 ```
 
-Every clock, each scheduler has on average **1 active warp and 0.11 eligible warps**. An A10G scheduler can pick from up to 12. We're starving it. 89% of cycles issue **nothing**, because every active warp is stalled waiting for a dependency. Almost certainly the `cp.async` we just issued, since we `cp_async_wait_group(0)` immediately.
+**89% of cycles issue nothing.** The schedulers have 0.11 eligible warps per cycle on average. Every active warp is stalled waiting for a dependency.
 
 ### 5.3 Shared memory is a minefield
 
 ```
 OPT   Est. Speedup: 55.81%
-      The memory access pattern for shared loads might not be optimal and
-      causes on average a 5.5 - way bank conflict across all 214,016 shared
-      load requests. This results in 966,656 bank conflicts, which represent
-      81.66% of the overall 1,183,744 wavefronts for shared loads.
+      The memory access pattern for shared loads causes on average a 5.5-way
+      bank conflict across all 214,016 shared load requests. This results in
+      966,656 bank conflicts, 81.66% of the overall 1,183,744 wavefronts.
 
 OPT   Est. Speedup: 59.8%
-      Shared stores: 8.0-way bank conflicts across 4,096 requests,
-      28,672 bank conflicts (87.50% of wavefronts).
+      Shared stores: 8.0-way bank conflicts, 87.50% of wavefronts.
 ```
 
-**81% of shared loads and 87% of shared stores are bank-conflicting.** Both GEMMs (`Q @ K^T` and `P @ V`) use `ldmatrix` to feed the Tensor Cores; `ldmatrix` wants its source in a swizzled layout, and we gave it plain row-major. Every warp's ldmatrix issue serializes across 5 to 8 bank-conflict cycles instead of completing in 1.
+**81% of shared loads and 87% of shared stores are bank-conflicting.** Both GEMMs use generic smem copies that collide on banks because we gave them a plain row-major layout. This is the biggest single leak in the naive kernel.
 
-This is the single biggest leak. Ncu estimates ~56% speedup just from fixing load conflicts and ~60% from fixing store conflicts (these overlap, so the real number is lower, but 1.5x is a reasonable target).
-
-### 5.4 Occupancy is pinned by shared memory
+### 5.4 Occupancy pinned by shared memory
 
 ```
 Section: Occupancy
-    Block Limit Registers                 3 blocks / SM
     Block Limit Shared Mem                2 blocks / SM   <- binding
-    Theoretical Active Warps per SM       8 warps
     Theoretical Occupancy                16.67 %
     Achieved Occupancy                    8.32 %
-
-OPT   The 2.00 theoretical warps per scheduler this kernel can issue
-      according to its occupancy are below the hardware maximum of 12.
-      This kernel's theoretical occupancy (16.7%) is limited by the required
-      amount of shared memory.
 ```
 
-We're using **49 KB of shared memory per block** (`sQ + sK + sV` = `64*128*2 + 64*128*2 + 64*128*2` bytes = 48 KB, plus driver overhead). Each SM has 100 KB usable, so we fit 2 blocks per SM. That caps theoretical occupancy at 16.7%, and because warps stall so often we only achieve *half* of that, 8.32%.
+48 KB of shared memory per block caps us at 2 blocks per SM, theoretical occupancy 16.7%. Because warps stall so often we only hit half of that.
 
-The natural fix here is to be smarter about `Q`'s residency. `Q` gets loaded into shmem, then immediately `ldmatrix`'d to registers every iteration. If we `ldmatrix` it once at the top of the kernel and leave it in registers, shmem drops by 16 KB, occupancy improves, and we save one redundant load per iteration. Double-buffering `K` and `V` for pipelining eats some of that savings back, but the arithmetic still works out.
+So we have three candidate fixes to try:
 
-### 5.5 Instruction mix and stall counts
+1. **Pipeline the cp.async loads** so the MMA doesn't wait for data (targets the 89% "no eligible" stalls).
+2. **Swizzle the shared-memory layout** so `ldmatrix` doesn't bank-conflict (targets the 81–87% conflicts).
+3. **Use the real `ldmatrix` instruction** instead of the generic `CopyUniversalOp` (this is what wants the swizzled layout in the first place).
 
-```
-Section: Warp State Statistics
-    Warp Cycles Per Issued Instruction       9.14 cycles
-    Warp Cycles Per Executed Instruction     9.16 cycles
-    Avg. Active Threads Per Warp             32
-    Avg. Not Predicated Off Threads Per Warp 31.93
-```
-
-9 cycles per issued instruction is the average stall latency each time a warp actually issues. Compare that to the matmul-kernel stall of ~1 to 2 cycles you'd see in a well-tuned GEMM. The stalls live in three places: `cp.async` arrivals, `ldmatrix` bank conflicts, and register-pressure-induced reissues. All three will be addressed in the next round.
-
-```
-Registers Per Thread    168
-```
-
-168 registers is high, close to the 255 hard cap. Accumulators eat most of it: `acc_O` is `64x128` fp32 = 8192 elements = 256 regs per thread if divided across 128 threads. That's before `row_max`, `row_sum`, `acc_S`, and a fragment of `Q`. This is also why the register block limit says "3": we're lucky we're shared-memory limited first.
+I tried them in that order. Two of the three helped. One did not. Here's how it went.
 
 ---
 
-## 6. Where That Leaves Us
+## 6. Attempt 1: Shared-Memory Pipelining (the one that didn't help)
 
-Rolling the profile into a prioritized list:
+The idea is textbook. Right now, the inner loop does:
 
-| Finding                                    | Est. impact  | Fix                                                   |
-|--------------------------------------------|--------------|-------------------------------------------------------|
-| 81 to 87% shared-mem bank conflicts        | ~1.5x        | Swizzled smem layouts for `Q`, `K`, `V`               |
-| 89% "no eligible warp" stalls              | ~1.3 to 1.5x | Multi-stage `cp.async` pipelining (prologue + double buffer) |
-| 16.7% theoretical, 8.3% achieved occupancy | ~1.2x        | Keep `Q` in registers, alias where possible           |
-| 168 regs/thread                            | softer limit | Revisit after pipelining (may spill, may not)         |
+```
+load K  →  wait  →  MMA1  →  load V  →  wait  →  MMA2
+```
 
-Stacked, those roughly justify the 2.02x SDPA gap. SDPA on sm_86 uses FlashAttention-2 (PyTorch dispatches to it) with well-tuned swizzles and pipelining, so "match SDPA" is a realistic goal and "beat SDPA" is a stretch-but-plausible one.
+Everything is sequential. If I double-buffer `K` and `V`, I can start the next iteration's loads while the current MMA is running:
 
-And just to keep ourselves honest, the running table again:
+```
+load K[0]                    (prologue)
+for kv in range(N):
+    wait K[kv]
+    start V[kv] load          // overlaps with MMA1
+    MMA1 (using K[kv])
+    wait V[kv]
+    start K[kv+1] load        // overlaps with MMA2
+    MMA2 (using V[kv])
+```
 
-| Version         | 1024x1024 | vs SDPA      | Key change                |
-|-----------------|-----------|--------------|---------------------------|
-| Naive CuteDSL   | 0.417 ms  | 2.02x slower | baseline                  |
-| + Swizzle       | ???       | ???          | kill bank conflicts       |
-| + Pipeline      | ???       | ???          | overlap cp.async with MMA |
-| + Split-K warps | ???       | ???          | fix occupancy             |
+I allocate two buffers for K, two for V, and use `kv % 2` to toggle between them. The code is in [fa2_shared_mem_pipelining_cutedsl.py](https://github.com/Vishal-Padia/fa2/blob/main/fa2_shared_mem_pipelining_cutedsl.py).
+
+Running it:
+
+```
+TIMING  (1024x1024)
+  Mean:     0.352 ms  (trimmed)
+  TFLOP/s:  24.41
+  Ours vs SDPA: 1.70x slower
+```
+
+0.352 ms vs the naive 0.417 ms. A 1.18x speedup, but that's entirely because this version also happens to use a swizzled smem layout (I was iterating on both at once). When I later isolated swizzling into its own file, swizzle *alone* went to 0.308 ms. So pipelining, on top of swizzling, was a **0.12 ms regression**. Not a win, a loss.
+
+### Why it didn't work
+
+A few things stacked:
+
+1. **V double-buffering didn't survive contact.** I spent hours trying to get `sV0` / `sV1` to work and couldn't get correct results out of the kernel. At some point I stopped fighting it and shipped a version where only `K` is actually double-buffered; `V` reuses a single buffer. The committed code shows the vestige, there's a `tVsV0` and `tVsV1` in the partition setup but both point at `sV0`. So the `V` load still serializes with MMA2.
+2. **Even with K-only pipelining, the `wait_group(0)` pattern kills the overlap.** The correct CuteDSL idiom for 2-stage pipelining is `cp_async_wait_group(N-1)` where `N` is the number of in-flight groups. You want to wait for *all but the most recent* group. `wait_group(0)` waits for everything, which is basically the same as the naive kernel.
+3. **The stalls ncu was flagging might not even be `cp.async` stalls.** Looking at the swizzle-only profile (below), removing bank conflicts brought "no eligible" stalls from 89% down to 40%. A lot of what I was attributing to memory latency was actually bank-conflict serialization in `ldmatrix`. Pipelining can't fix that.
+
+In hindsight I should have done swizzle first and pipelining second. Or third. Or not at all at this tile size; at `BLOCK_KV=64` the `cp.async` for K is only 16 KB, the whole MMA loop inside runs in a few hundred cycles, and there's not actually that much latency to hide. Pipelining pays for itself on larger tiles.
+
+I'm leaving the broken-ish version in the repo because I think the *attempt* is more useful than a clean final. If someone wants to finish it properly, the change list is: get full `sV0`/`sV1` double-buffering working, switch every `cp_async_wait_group(0)` in the main loop to `cp_async_wait_group(1)`, and move the first `K[0]` load into the prologue before the loop.
 
 ---
 
-## What's next
+## 7. Attempt 2: Swizzling (the one that worked)
 
-The optimizations are the fun part, and I'll fold them into this post as I finish them. In rough order: swizzled shared-memory layouts to kill the bank conflicts, then a multi-stage `cp.async` pipeline with double-buffered `K` and `V`, then register-held `Q` to claw back occupancy. Each of those has its own CuteDSL spell (`composition(Swizzle, layout)`, `cp_async_wait_group(N-1)` tricks, `make_fragment_like`), and each deserves a walk-through rather than a drive-by.
+`ldmatrix` wants its source laid out in shared memory in a specific permuted pattern so that the 32 lanes of a warp hit 32 distinct banks. A plain row-major layout doesn't do that; an `H=128` row lands on the same banks as the next row modulo 32, and you get the 5.5-way conflicts ncu was flagging.
 
-If you want to poke at the baseline yourself, everything is in this repo: [`fa2_using_pytorch.py`](./fa2_using_pytorch.py) for the reference algorithm and [`fa2_naive_cutedsl.py`](./fa2_naive_cutedsl.py) for the kernel in this post. Run with `.venv/bin/python fa2_naive_cutedsl.py` and you'll get the numbers above, give or take 10% depending on your GPU.
+CuTe handles this with a **swizzle function** that remaps addresses within a layout. The spell in CuteDSL is:
 
-As always, happy to chat if anything here is unclear or wrong - reach out to me on X [@KyrieBlunders](https://x.com/KyrieBlunders).
+```python
+sw = cute.make_swizzle(3, 3, 3)
+
+sQ_layout_atom = cute.make_composed_layout(
+    sw, 0,
+    cute.make_layout((8, 64), stride=(64, 1)),
+)
+sQ_layout = cute.tile_to_shape(sQ_layout_atom, (BLOCK_Q, HEAD_DIM), (0, 1))
+```
+
+`Swizzle<3, 3, 3>` is the one to memorize for sm_80+ with 128-byte rows: it XORs 3 bits of the column index into 3 bits of the row index at a stride of 3 bits, which is exactly what you need to get conflict-free `ldmatrix` for 8x8 fp16 tiles. `make_composed_layout` then composes this permutation with a plain layout, and `tile_to_shape` stamps out the swizzled atom across the full `(BLOCK_Q, HEAD_DIM)` tile.
+
+The beautiful part of CuteDSL is that **literally nothing else in the kernel changes.** The partitions, the copies, the MMA, the online softmax, all the same. The swizzle is entirely contained inside the layout objects; logical coordinates behave the same, only the physical address computation differs. The full file is [fa2_swizzle_cutedsl.py](https://github.com/Vishal-Padia/fa2/blob/main/fa2_swizzle_cutedsl.py) and the diff from naive is just the layout construction. Every kernel body line is identical.
+
+### Results
+
+```
+TIMING  (1024x1024)
+  Mean:     0.308 ms  (trimmed)
+  TFLOP/s:  27.93
+  Ours vs SDPA: 1.48x slower
+```
+
+**1.35x speedup.** And the profile explains exactly why:
+
+```
+Section: Memory Workload Analysis
+    No warnings about bank conflicts.
+
+Section: Scheduler Statistics
+    One or More Eligible                 64.67 %   (was 10.96)
+    Issued Warp Per Scheduler             0.65     (was 0.11)
+    No Eligible                          35.33 %   (was 89.04)
+
+Section: Occupancy
+    Achieved Occupancy                   25.36 %   (was 8.32)
+```
+
+Bank conflicts: gone. "No eligible" stalls: cut by more than half. Occupancy: tripled, which I did not expect. My theory is that the bank-conflict serialization was holding warps resident longer than the hardware would have otherwise, and once it's gone the scheduler can actually rotate through warps as designed.
+
+One tile shape detail worth flagging: the swizzle atom's `k_block_size` has to match the row stride the swizzle is permuting over. For `HEAD_DIM=128` and fp16, a 64-element inner dimension (128 bytes) works cleanly. The `8` in the atom shape is `BLOCK_Q / 8`, one row per 8x8 `ldmatrix` tile. Getting these numbers wrong silently gives you the wrong layout and bank conflicts come back.
+
+---
+
+## 8. Attempt 3: Actual `ldmatrix` (the one that got us closest)
+
+Up to this point, the `smem -> register` copy that feeds the Tensor Cores has been using `cute.nvgpu.CopyUniversalOp()`, the "just load each element" generic copy. It works, but it doesn't issue the real `ldmatrix.sync.aligned.m8n8` instruction, which loads a full 8x8 tile into MMA operand layout in a single warp-level op. That's the instruction all the swizzle bit-twiddling was designed for.
+
+The swap is tiny:
+
+```python
+# before
+smem_copy_atom = cute.make_copy_atom(
+    cute.nvgpu.CopyUniversalOp(), mQ.element_type
+)
+
+# after
+smem_copy_atom_QK = cute.make_copy_atom(
+    warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=4),
+    mQ.element_type,
+)
+smem_copy_atom_V = cute.make_copy_atom(
+    warp.LdMatrix8x8x16bOp(transpose=True, num_matrices=4),
+    mQ.element_type,
+)
+```
+
+For `Q` and `K` we want the straight `ldmatrix`. For `V`, the second GEMM's B operand needs it transposed, and `ldmatrix.sync.aligned.m8n8.trans` does that transpose for free in one instruction (this is the right way to handle the `sVt` view from the naive kernel). The rest of the kernel body is again unchanged.
+
+Full code: [fa2_ldmatrix_cutedsl.py](https://github.com/Vishal-Padia/fa2/blob/main/fa2_ldmatrix_cutedsl.py).
+
+### Results
+
+```
+TIMING  (1024x1024)
+  Mean:     0.268 ms  (trimmed)
+  TFLOP/s:  32.01
+  Ours vs SDPA: 1.30x slower
+```
+
+Another **1.15x on top of swizzle**, total **1.55x** vs the naive baseline. This is about what I expected: swizzle set up the smem layout so that a real `ldmatrix` could use it, and a real `ldmatrix` actually pays the dividend. Without the swizzle, `ldmatrix` would re-introduce bank conflicts. Without the `ldmatrix`, the swizzle is correct but under-exploited.
+
+The profile looks almost identical to swizzle-only, which makes sense: memory and occupancy are already in a reasonable place, and the win here comes from fewer instructions issued per smem->reg load. TFLOP/s is what moved, 27.93 -> 32.01.
+
+---
+
+## 9. Where We Landed, and Why Still Behind SDPA
+
+Final table:
+
+
+| Version                 | 1024x1024 | TFLOP/s | vs SDPA      |
+| ----------------------- | --------- | ------- | ------------ |
+| Naive CuteDSL           | 0.417 ms  | 20.61   | 2.02x slower |
+| + Pipelining (broken)   | 0.352 ms  | 24.41   | 1.70x slower |
+| + Swizzle (no pipeline) | 0.308 ms  | 27.93   | 1.48x slower |
+| + LDMatrix (on swizzle) | 0.268 ms  | 32.01   | 1.30x slower |
+| PyTorch SDPA            | 0.207 ms  | 41.55   | 1.00x        |
+
+
+We got from 2x slower to 1.30x slower. Not bad for a weekend project, and frankly I was not going to beat SDPA. PyTorch's SDPA on sm_86 dispatches to Flash Attention 2 underneath, with code tuned by people who have forgotten more about CuTe than I currently know. The remaining 1.30x is, I think, a mix of:
+
+- **My tile shapes aren't ideal.** BLOCK_Q=64, BLOCK_KV=64 is a safe choice, but larger tiles amortize the prologue and expose more parallelism per block. I'd want to sweep at least `{64, 128} x {64, 128}` and probably push BLOCK_KV up.
+- **I never got pipelining to work.** That's real throughput left on the table, and it's what the "89% no eligible" -> "35%" improvement hinted at. Getting to 10% or lower requires actual overlap of cp.async with MMA.
+- **168 registers per thread is high.** The accumulators eat most of it. A smarter layout (or WGMMA on Hopper, not available here) would use fewer.
+- **Bare honesty: my CuteDSL fluency is still limited.** I can recognize what the profile is telling me, but I can't always translate "I need this thing to happen" into the right `make_tiled_copy_B` / `retile` / `partition_`* incantation on the first try. More reps required.
+
+So: couldn't beat SDPA, got within 30%, learned a lot more from what didn't work than what did.
+
+---
+
+## What's Next
+
+Things I want to try, roughly in order:
+
+1. **Larger tiles.** `BLOCK_KV=128` with the same `BLOCK_Q=64` is probably the next easy win.
+2. **Port to Hopper.** WGMMA + TMA would be a different kernel, not an incremental change, but the whole point of CuteDSL is that the abstractions should carry across architectures.
+
+I'll extend this post as things land. Meanwhile, everything in here is in the repo: [fa2_using_pytorch.py](https://github.com/Vishal-Padia/fa2/blob/main/fa2_using_pytorch.py), [fa2_naive_cutedsl.py](https://github.com/Vishal-Padia/fa2/blob/main/fa2_naive_cutedsl.py), [fa2_shared_mem_pipelining_cutedsl.py](https://github.com/Vishal-Padia/fa2/blob/main/fa2_shared_mem_pipelining_cutedsl.py), [fa2_swizzle_cutedsl.py](https://github.com/Vishal-Padia/fa2/blob/main/fa2_swizzle_cutedsl.py), [fa2_ldmatrix_cutedsl.py](https://github.com/Vishal-Padia/fa2/blob/main/fa2_ldmatrix_cutedsl.py). Run with `.venv/bin/python <file>.py` and you'll get the numbers above, give or take 10% depending on your GPU.
+
+As always, happy to chat if anything here is unclear or wrong. Just ping me on [Twitter](https://x.com/KyrieBlunders).
