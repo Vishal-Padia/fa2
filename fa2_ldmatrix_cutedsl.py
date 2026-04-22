@@ -5,6 +5,7 @@ import cutlass.cute as cute
 from cutlass.cute.nvgpu import cpasync
 from cutlass.cute.runtime import from_dlpack
 import cuda.bindings.driver as cuda
+from cutlass.cute.nvgpu import warp
 
 
 BLOCK_Q  = 64
@@ -13,7 +14,7 @@ HEAD_DIM = 128
 NUM_THREADS = 128  # 4 warps
 
 
-class FlashAttnSwizzle:
+class FlashAttnLDMatrix:
     def __init__(self):
         pass
 
@@ -75,7 +76,6 @@ class FlashAttnSwizzle:
             store_atom, tQKV_layout, vQKV_layout
         )
 
-        from cutlass.cute.nvgpu import warp
         tiled_mma = cute.make_tiled_mma(
             warp.MmaF16BF16Op(mQ.element_type, cutlass.Float32, (16, 8, 16)),
             (NUM_THREADS // 32, 1, 1),
@@ -174,12 +174,17 @@ class FlashAttnSwizzle:
 
         num_kv_tiles = cute.ceil_div(mK.shape[1], BLOCK_KV)
 
-        smem_copy_atom = cute.make_copy_atom(
-            cute.nvgpu.CopyUniversalOp(), mQ.element_type
+        smem_copy_atom_QK = cute.make_copy_atom(
+            warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=4),
+            mQ.element_type,
         )
-        smem_tiled_copy_Q = cute.make_tiled_copy_A(smem_copy_atom, tiled_mma)
-        smem_tiled_copy_K = cute.make_tiled_copy_B(smem_copy_atom, tiled_mma)
-        smem_tiled_copy_V = cute.make_tiled_copy_B(smem_copy_atom, tiled_mma)
+        smem_copy_atom_V = cute.make_copy_atom(
+            warp.LdMatrix8x8x16bOp(transpose=True, num_matrices=4),
+            mQ.element_type,
+        )
+        smem_tiled_copy_Q = cute.make_tiled_copy_A(smem_copy_atom_QK, tiled_mma)
+        smem_tiled_copy_K = cute.make_tiled_copy_B(smem_copy_atom_QK, tiled_mma)
+        smem_tiled_copy_V = cute.make_tiled_copy_B(smem_copy_atom_V, tiled_mma)
 
         smem_thr_copy_Q = smem_tiled_copy_Q.get_slice(tidx)
         smem_thr_copy_K = smem_tiled_copy_K.get_slice(tidx)
@@ -297,7 +302,10 @@ class FlashAttnSwizzle:
 
         sO = cute.make_tensor(sQ.iterator, sQ.layout)
 
-        smem_tiled_copy_O = cute.make_tiled_copy_C(smem_copy_atom, tiled_mma)
+        smem_copy_atom_O = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(), mQ.element_type
+        )
+        smem_tiled_copy_O = cute.make_tiled_copy_C(smem_copy_atom_O, tiled_mma)
         smem_thr_copy_O = smem_tiled_copy_O.get_slice(tidx)
         taccOrO = smem_thr_copy_O.retile(rO)
         taccOrsO = smem_thr_copy_O.partition_D(sO)
@@ -340,7 +348,7 @@ def run_flash_attn(B, N, Sq, Sk, H, dtype=torch.float16, num_warmup=5, num_iters
     cV = from_dlpack(V, assumed_align=16)
     cO = from_dlpack(O, assumed_align=16)
 
-    fa = FlashAttnSwizzle()
+    fa = FlashAttnLDMatrix()
 
     print(f"Config: B={B}, N={N}, Sq={Sq}, Sk={Sk}, H={H}, dtype={dtype}")
     print(f"Tiles:  BLOCK_Q={BLOCK_Q}, BLOCK_KV={BLOCK_KV}, NUM_THREADS={NUM_THREADS}")
@@ -488,7 +496,7 @@ def run_flash_attn(B, N, Sq, Sk, H, dtype=torch.float16, num_warmup=5, num_iters
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("Flash Attention v2: Swizzled CuteDSL")
+    print("Flash Attention v2: LDMatrix CuteDSL")
     print("=" * 60)
     print()
 

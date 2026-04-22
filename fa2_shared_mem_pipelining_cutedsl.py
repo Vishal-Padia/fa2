@@ -6,9 +6,7 @@ from cutlass.cute.nvgpu import cpasync
 from cutlass.cute.runtime import from_dlpack
 import cuda.bindings.driver as cuda
 
-# ----------------------------------------------------------------
-# Config
-# ----------------------------------------------------------------
+
 BLOCK_Q  = 64
 BLOCK_KV = 64
 HEAD_DIM = 128
@@ -29,25 +27,29 @@ class FlashAttnPipelined:
         scale: cutlass.Float32,
         stream: cuda.CUstream,
     ):
-        # ---- shared memory layouts (still row-major, no swizzle yet) ----
-        sQ_layout = cute.make_layout(
-            (BLOCK_Q, HEAD_DIM), stride=(HEAD_DIM, 1)
-        )
-        sKV_layout = cute.make_layout(
-            (BLOCK_KV, HEAD_DIM), stride=(HEAD_DIM, 1)
-        )
+        smem_k_block_size = 64  # HEAD_DIM % 64 == 0
+        sw = cute.make_swizzle(3, 3, 3)
 
-        # ---- shared memory struct: double-buffered K and V ----
+        sQ_layout_atom = cute.make_composed_layout(
+            sw, 0,
+            cute.make_layout((8, smem_k_block_size), stride=(smem_k_block_size, 1))
+        )
+        sQ_layout = cute.tile_to_shape(sQ_layout_atom, (BLOCK_Q, HEAD_DIM), (0, 1))
+
+        sKV_layout_atom = cute.make_composed_layout(
+            sw, 0,
+            cute.make_layout((8, smem_k_block_size), stride=(smem_k_block_size, 1))
+        )
+        sKV_layout = cute.tile_to_shape(sKV_layout_atom, (BLOCK_KV, HEAD_DIM), (0, 1))
+        sV_layout = cute.make_layout((BLOCK_KV, HEAD_DIM), stride=(HEAD_DIM, 1))
+
         @cute.struct
         class SharedStorage:
             sQ:  cute.struct.MemRange[mQ.element_type, BLOCK_Q  * HEAD_DIM]
-            # TODO: add double buffers for K (sK0, sK1) and V (sV0, sV1)
             sK0: cute.struct.MemRange[mQ.element_type, BLOCK_KV * HEAD_DIM]
             sK1: cute.struct.MemRange[mQ.element_type, BLOCK_KV * HEAD_DIM]
             sV0: cute.struct.MemRange[mQ.element_type, BLOCK_KV * HEAD_DIM]
-            sV1: cute.struct.MemRange[mQ.element_type, BLOCK_KV * HEAD_DIM]
 
-        # ---- copy atoms (same as naive) ----
         elems_per_copy = 128 // mQ.element_type.width
         cp_atom = cute.make_copy_atom(
             cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL),
@@ -74,7 +76,6 @@ class FlashAttnPipelined:
             store_atom, tQKV_layout, vQKV_layout
         )
 
-        # ---- tiled MMA (same as naive) ----
         from cutlass.cute.nvgpu import warp
         tiled_mma = cute.make_tiled_mma(
             warp.MmaF16BF16Op(mQ.element_type, cutlass.Float32, (16, 8, 16)),
@@ -82,7 +83,6 @@ class FlashAttnPipelined:
             permutation_mnk=(NUM_THREADS // 32 * 16, 16, 16),
         )
 
-        # ---- launch ----
         grid = (
             cute.ceil_div(mQ.shape[1], BLOCK_Q),
             mQ.shape[0],
@@ -92,7 +92,7 @@ class FlashAttnPipelined:
         self.kernel(
             mQ, mK, mV, mO,
             scale,
-            sQ_layout, sKV_layout,
+            sQ_layout, sKV_layout, sV_layout,
             gmem_tiled_copy,
             gmem_tiled_store,
             tiled_mma,
@@ -111,8 +111,9 @@ class FlashAttnPipelined:
         mV: cute.Tensor,
         mO: cute.Tensor,
         scale: cutlass.Float32,
-        sQ_layout: cute.Layout,
-        sKV_layout: cute.Layout,
+        sQ_layout: cute.ComposedLayout,
+        sKV_layout: cute.ComposedLayout,
+        sV_layout: cute.Layout,
         gmem_tiled_copy: cute.TiledCopy,
         gmem_tiled_store: cute.TiledCopy,
         tiled_mma: cute.TiledMma,
@@ -121,16 +122,13 @@ class FlashAttnPipelined:
         tidx, _, _ = cute.arch.thread_idx()
         q_tile, batch, head = cute.arch.block_idx()
 
-        # ---- shared memory ----
         smem = cutlass.utils.SmemAllocator()
         storage = smem.allocate(SharedStorage)
         sQ  = storage.sQ.get_tensor(sQ_layout)
         sK0 = storage.sK0.get_tensor(sKV_layout)
         sK1 = storage.sK1.get_tensor(sKV_layout)
-        sV0 = storage.sV0.get_tensor(sKV_layout)
-        sV1 = storage.sV1.get_tensor(sKV_layout)
+        sV0 = storage.sV0.get_tensor(sV_layout)
 
-        # ---- global memory tiles (same as naive) ----
         gQ = cute.local_tile(
             mQ[batch, None, head, None],
             (BLOCK_Q, HEAD_DIM), (q_tile, 0),
@@ -148,29 +146,25 @@ class FlashAttnPipelined:
             (BLOCK_Q, HEAD_DIM), (q_tile, 0),
         )
 
-        # ---- copy partitions ----
         gmem_thr_copy = gmem_tiled_copy.get_slice(tidx)
 
         tQgQ = gmem_thr_copy.partition_S(gQ)
         tQsQ = gmem_thr_copy.partition_D(sQ)
 
         tKgK = gmem_thr_copy.partition_S(gK)
-        # TODO: partition copy destinations for both K buffers (tKsK0, tKsK1)
         tKsk0 = gmem_thr_copy.partition_D(sK0)
         tKsk1 = gmem_thr_copy.partition_D(sK1)
 
         tVgV = gmem_thr_copy.partition_S(gV)
-        # TODO: partition copy destinations for both V buffers (tVsV0, tVsV1)
         tVsV0 = gmem_thr_copy.partition_D(sV0)
-        tVsV1 = gmem_thr_copy.partition_D(sV1)
+        tVsV1 = gmem_thr_copy.partition_D(sV0)
 
-        # ---- load Q (once, same as naive) ----
+        # Load Q once
         cute.copy(gmem_tiled_copy, tQgQ, tQsQ)
         cute.arch.cp_async_commit_group()
         cute.arch.cp_async_wait_group(0)
         cute.arch.sync_threads()
 
-        # ---- MMA setup (same as naive) ----
         thr_mma = tiled_mma.get_slice(tidx)
 
         acc_O_shape = thr_mma.partition_shape_C((BLOCK_Q, HEAD_DIM))
@@ -188,7 +182,6 @@ class FlashAttnPipelined:
 
         num_kv_tiles = cute.ceil_div(mK.shape[1], BLOCK_KV)
 
-        # ---- smem→reg copy setup (same as naive) ----
         smem_copy_atom = cute.make_copy_atom(
             cute.nvgpu.CopyUniversalOp(), mQ.element_type
         )
@@ -204,7 +197,6 @@ class FlashAttnPipelined:
         tSsQ = smem_thr_copy_Q.partition_S(sQ)
         tsrQ_copy_view = smem_thr_copy_Q.retile(tSrQ)
 
-        # shape constants
         m_atom = cute.size(acc_O.shape[0][0])
         acc_S_shape = thr_mma.partition_shape_C((BLOCK_Q, BLOCK_KV))
         n_atom = cute.size(acc_S_shape[0][1])
@@ -212,19 +204,11 @@ class FlashAttnPipelined:
         o_n_atom = cute.size(acc_O.shape[0][1])
         o_n_tiles = cute.size(acc_O.shape[2])
 
-        # ============================================================
-        # PROLOGUE: kick off first K load into buffer 0
-        # ============================================================
-        # TODO: async copy K[0] into sK0, commit group
+        # Prologue: kick off K[0]
         cute.copy(gmem_tiled_copy, tKgK[None, None, None, 0], tKsk0)
         cute.arch.cp_async_commit_group()
 
-        # ============================================================
-        # MAIN LOOP
-        # ============================================================
         for kv in range(num_kv_tiles):
-            # TODO: select current buffers (sK_cur, sV_cur) and next
-            #       buffer destinations (tKsK_next, tVsV_next) based on kv % 2
             sK_cur = sK0
             sV_cur = sV0
             tVsV_cur = tVsV0
@@ -238,26 +222,22 @@ class FlashAttnPipelined:
                 tVsV_next = tVsV1
             else:
                 sK_cur = sK1
-                sV_cur = sV1
+                sV_cur = sV0
                 tVsV_cur = tVsV1
                 tKsK_next = tKsk0
                 tVsV_next = tVsV0
 
-            # TODO: wait for K load to complete (wait_group + sync_threads)
             cute.arch.cp_async_wait_group(0)
             cute.arch.sync_threads()
 
-            # -- 1st MMA: S = Q @ K.T --
             acc_S = cute.make_rmem_tensor(acc_S_shape, cutlass.Float32)
             acc_S.fill(0.0)
 
-            # TODO: use sK_cur instead of sK for fragment/partition setup
             tSrK = thr_mma.make_fragment_B(thr_mma.partition_B(sK_cur))
             tSsK = smem_thr_copy_K.partition_S(sK_cur)
             tSrK_copy_view = smem_thr_copy_K.retile(tSrK)
 
-            # TODO: start V[kv] load into current V buffer (overlaps with 1st MMA)
-            #       async copy + commit group
+            # Overlap V[kv] load with first MMA
             cute.copy(gmem_tiled_copy, tVgV[None, None, None, kv], tVsV_cur)
             cute.arch.cp_async_commit_group()
 
@@ -266,11 +246,9 @@ class FlashAttnPipelined:
                 cute.copy(smem_tiled_copy_K, tSsK[None, None, k], tSrK_copy_view[None, None, k])
                 cute.gemm(tiled_mma, acc_S, tSrQ[None, None, k], tSrK[None, None, k], acc_S)
 
-            # -- scale S (same as naive) --
             for i in cutlass.range_constexpr(cute.size(acc_S)):
                 acc_S[i] = acc_S[i] * scale
 
-            # -- online softmax (same as naive) --
             for row in cutlass.range_constexpr(cute.size(row_max)):
                 mi = row % m_atom
                 mt = row // m_atom
@@ -299,17 +277,14 @@ class FlashAttnPipelined:
 
                 row_max[row] = new_rowmax
 
-            # TODO: wait for V load to complete (wait_group + sync_threads)
             cute.arch.cp_async_wait_group(0)
             cute.arch.sync_threads()
 
-            # TODO: if kv+1 < num_kv_tiles, start K[kv+1] load into NEXT buffer
-            #       (overlaps with 2nd MMA)
+            # Overlap K[kv+1] load with second MMA
             if kv + 1 < num_kv_tiles:
                 cute.copy(gmem_tiled_copy, tKgK[None, None, None, kv + 1], tKsK_next)
                 cute.arch.cp_async_commit_group()
 
-            # -- 2nd MMA: O += P @ V --
             rP = cute.make_fragment_like(acc_S, mQ.element_type)
             rP.store(acc_S.load().to(mQ.element_type))
 
@@ -328,7 +303,6 @@ class FlashAttnPipelined:
             )
             tOrS = cute.make_tensor(rP.iterator, rP_mma_view)
 
-            # TODO: use sV_cur instead of sV for the transposed view
             sVt = cute.make_tensor(
                 sV_cur.iterator,
                 cute.make_layout((HEAD_DIM, BLOCK_KV), stride=(1, HEAD_DIM))
@@ -341,9 +315,7 @@ class FlashAttnPipelined:
                 cute.copy(smem_tiled_copy_V, tOsVt[None, None, k], tOrVt_copy_view[None, None, k])
                 cute.gemm(tiled_mma, acc_O, tOrS[None, None, k], tOrVt[None, None, k], acc_O)
 
-        # ============================================================
-        # EPILOGUE: normalize and write output (same as naive)
-        # ============================================================
+        # Epilogue
         for row in cutlass.range_constexpr(cute.size(row_max)):
             mi = row % m_atom
             mt = row // m_atom
@@ -372,9 +344,6 @@ class FlashAttnPipelined:
         cute.copy(gmem_tiled_store, tOgsO, tOgO)
 
 
-# ====================================================================
-# Launch harness
-# ====================================================================
 def pytorch_reference(Q, K, V, scale):
     attn = torch.matmul(Q.float(), K.float().transpose(-2, -1)) * scale
     attn = F.softmax(attn, dim=-1)
@@ -553,7 +522,7 @@ def run_flash_attn(B, N, Sq, Sk, H, dtype=torch.float16, num_warmup=5, num_iters
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("Flash Attention v2 — Pipelined CuteDSL (v2)")
+    print("Flash Attention v2: Pipelined CuteDSL")
     print("=" * 60)
     print()
 
