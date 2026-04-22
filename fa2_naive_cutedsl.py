@@ -1,4 +1,3 @@
-from math import inf
 import torch
 import torch.nn.functional as F
 import cutlass
@@ -6,15 +5,13 @@ import cutlass.cute as cute
 from cutlass.cute.nvgpu import cpasync
 from cutlass.cute.runtime import from_dlpack
 import cuda.bindings.driver as cuda
-import time
 
-# ----------------------------------------------------------------
-# Config — start small, we'll tune later
-# ----------------------------------------------------------------
-BLOCK_Q  = 64    # Q tile rows per threadblock
-BLOCK_KV = 64    # KV tile rows per threadblock
-HEAD_DIM = 128   # head dimension (fixed for now)
-NUM_THREADS = 128  # threads per block = 4 warps
+
+BLOCK_Q  = 64
+BLOCK_KV = 64
+HEAD_DIM = 128
+NUM_THREADS = 128  # 4 warps
+
 
 class FlashAttnNaive:
     def __init__(self):
@@ -30,11 +27,6 @@ class FlashAttnNaive:
         scale: cutlass.Float32,
         stream: cuda.CUstream,
     ):
-        # ---- Step 1: shared memory layout ----
-        # For naive version: simple row-major, NO swizzle
-        # Layout atom: (BLOCK_Q, HEAD_DIM) with stride (HEAD_DIM, 1)
-        # This is the simplest possible layout — will have bank conflicts
-        # but that's fine for v1
         sQ_layout = cute.make_layout(
             (BLOCK_Q, HEAD_DIM),
             stride=(HEAD_DIM, 1)
@@ -44,33 +36,19 @@ class FlashAttnNaive:
             stride=(HEAD_DIM, 1)
         )
 
-        # ---- Step 2: shared memory struct ----
-        # Q overlaps with K (Q loaded once, stays in registers)
-        # K and V are separate (both needed simultaneously... actually no)
-        # For naive: give each their own region, simplest approach
         @cute.struct
         class SharedStorage:
-            # Q_smem: BLOCK_Q * HEAD_DIM elements
             sQ: cute.struct.MemRange[mQ.element_type, BLOCK_Q * HEAD_DIM]
-            # K_smem: BLOCK_KV * HEAD_DIM elements
             sK: cute.struct.MemRange[mQ.element_type, BLOCK_KV * HEAD_DIM]
-            # V_smem: BLOCK_KV * HEAD_DIM elements
             sV: cute.struct.MemRange[mQ.element_type, BLOCK_KV * HEAD_DIM]
 
-        # ---- Step 3: copy atom for global->shared ----
-        # For naive: use simple cp.async (no vectorization tricks yet)
-        # 128-bit = 8 fp16 elements per copy
         cp_atom = cute.make_copy_atom(
             cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL),
             mQ.element_type,
             num_bits_per_copy=128,
         )
 
-        # ---- Step 4: thread layout for the copy ----
-        # NUM_THREADS threads, each copying 8 elements (128 bits / 16 bits)
-        # tQKV_layout: how threads are arranged for the copy
-        # (NUM_THREADS / (HEAD_DIM/8), HEAD_DIM/8) with stride (HEAD_DIM/8, 1)
-        elems_per_copy = 128 // mQ.element_type.width  # = 8 for fp16
+        elems_per_copy = 128 // mQ.element_type.width  # 8 for fp16
         tQKV_layout = cute.make_layout(
             (NUM_THREADS // (HEAD_DIM // elems_per_copy),
              HEAD_DIM // elems_per_copy),
@@ -90,9 +68,6 @@ class FlashAttnNaive:
             store_atom, tQKV_layout, vQKV_layout
         )
 
-        # ---- Step 5: tiled MMA ----
-        # Ampere: mma.m16n8k16 with fp16 inputs, fp32 accumulator
-        # (NUM_THREADS // 32) warps in M dimension
         from cutlass.cute.nvgpu import warp
         tiled_mma = cute.make_tiled_mma(
             warp.MmaF16BF16Op(mQ.element_type, cutlass.Float32, (16, 8, 16)),
@@ -100,12 +75,10 @@ class FlashAttnNaive:
             permutation_mnk=(NUM_THREADS // 32 * 16, 16, 16),
         )
 
-        # ---- Step 6: launch grid ----
-        # One threadblock per (batch, head, q_tile)
         grid = (
-            cute.ceil_div(mQ.shape[1], BLOCK_Q),  # q tiles
-            mQ.shape[0],                           # batch
-            mQ.shape[2],                           # num heads
+            cute.ceil_div(mQ.shape[1], BLOCK_Q),
+            mQ.shape[0],
+            mQ.shape[2],
         )
 
         self.kernel(
@@ -137,25 +110,20 @@ class FlashAttnNaive:
         tiled_mma: cute.TiledMma,
         SharedStorage: cutlass.Constexpr,
     ):
-        # ---- thread/block indices ----
         tidx, _, _  = cute.arch.thread_idx()
         q_tile, batch, head = cute.arch.block_idx()
 
-        # ---- shared memory ----
         smem = cutlass.utils.SmemAllocator()
         storage = smem.allocate(SharedStorage)
         sQ = storage.sQ.get_tensor(sQ_layout)
         sK = storage.sK.get_tensor(sKV_layout)
         sV = storage.sV.get_tensor(sKV_layout)
 
-        # ---- global memory tiles ----
-        # gQ: [BLOCK_Q, HEAD_DIM] — the Q tile this block owns
         gQ = cute.local_tile(
             mQ[batch, None, head, None],
             (BLOCK_Q, HEAD_DIM),
             (q_tile, 0),
         )
-        # gK, gV: [BLOCK_KV, HEAD_DIM, num_kv_tiles]
         gK = cute.local_tile(
             mK[batch, None, head, None],
             (BLOCK_KV, HEAD_DIM),
@@ -172,32 +140,25 @@ class FlashAttnNaive:
             (q_tile, 0),
         )
 
-        # ---- copy partitions ----
         gmem_thr_copy = gmem_tiled_copy.get_slice(tidx)
-        tQgQ = gmem_thr_copy.partition_S(gQ)   # src: global Q
-        tQsQ = gmem_thr_copy.partition_D(sQ)   # dst: shared Q
-        tKgK = gmem_thr_copy.partition_S(gK)   # src: global K
-        tKsK = gmem_thr_copy.partition_D(sK)   # dst: shared K
-        tVgV = gmem_thr_copy.partition_S(gV)   # src: global V
-        tVsV = gmem_thr_copy.partition_D(sV)   # dst: shared V
+        tQgQ = gmem_thr_copy.partition_S(gQ)
+        tQsQ = gmem_thr_copy.partition_D(sQ)
+        tKgK = gmem_thr_copy.partition_S(gK)
+        tKsK = gmem_thr_copy.partition_D(sK)
+        tVgV = gmem_thr_copy.partition_S(gV)
+        tVsV = gmem_thr_copy.partition_D(sV)
 
-        # ---- load Q into shared memory (once, stays there) ----
         cute.copy(gmem_tiled_copy, tQgQ, tQsQ)
         cute.arch.cp_async_commit_group()
         cute.arch.cp_async_wait_group(0)
         cute.arch.sync_threads()
 
-        # ---- MMA partitions ----
         thr_mma = tiled_mma.get_slice(tidx)
 
-        # accumulators
         acc_O_shape = thr_mma.partition_shape_C((BLOCK_Q, HEAD_DIM))
         acc_O = cute.make_rmem_tensor(acc_O_shape, cutlass.Float32)
         acc_O.fill(0.0)
 
-        # ---- online softmax state ----
-        # row_max and row_sum: one value per row owned by this thread
-        # shape comes from the MMA accumulator M dimension
         row_max = cute.make_rmem_tensor(
             (acc_O.shape[0][0] * acc_O.shape[1],), cutlass.Float32
         )
@@ -207,10 +168,8 @@ class FlashAttnNaive:
         row_max.fill(-cutlass.Float32.inf)
         row_sum.fill(0.0)
 
-        # ---- KV loop ----
         num_kv_tiles = cute.ceil_div(mK.shape[1], BLOCK_KV)
 
-        #smem copy setup
         smem_copy_atom = cute.make_copy_atom(
             cute.nvgpu.CopyUniversalOp(),
             mQ.element_type
@@ -240,21 +199,18 @@ class FlashAttnNaive:
 
         for kv in range(num_kv_tiles):
 
-            # -- load K --
             cute.copy(gmem_tiled_copy, tKgK[None, None, None, kv], tKsK)
             cute.arch.cp_async_commit_group()
             cute.arch.cp_async_wait_group(0)
             cute.arch.sync_threads()
 
-            # -- S = Q @ K.T --
             acc_S = cute.make_rmem_tensor(acc_S_shape, cutlass.Float32)
             acc_S.fill(0.0)
 
-            # TODO: fill in — 1st MMA
             tSrK = thr_mma.make_fragment_B(thr_mma.partition_B(sK))
             tSsK = smem_thr_copy_K.partition_S(sK)
             tSrK_copy_view = smem_thr_copy_K.retile(tSrK)
-            
+
             for k in cutlass.range_constexpr(cute.size(tSsQ.shape[2])):
                 cute.copy(
                     smem_tiled_copy_Q,
@@ -267,61 +223,47 @@ class FlashAttnNaive:
                     tSrK_copy_view[None, None, k]
                 )
                 cute.gemm(tiled_mma, acc_S, tSrQ[None, None, k], tSrK[None, None, k], acc_S)
-            
-            # -- scale S --
-            # TODO: multiply acc_S by scale
+
             for i in cutlass.range_constexpr(cute.size(acc_S)):
                 acc_S[i] = acc_S[i] * scale
 
-            # -- online softmax --
-            # TODO: update row_max, row_sum, rescale acc_O
-            # one iteration per logical row owned by this thread
             for row in cutlass.range_constexpr(cute.size(row_max)):
                 mi = row % m_atom
                 mt = row // m_atom
 
-                # row max over S(row, :)
                 tile_max = -cutlass.Float32.inf
                 for nt in cutlass.range_constexpr(n_tiles):
                     for ni in cutlass.range_constexpr(n_atom):
                         tile_max = max(tile_max, acc_S[(ni, mi), mt, nt])
-                
-                # quad reduction: each MMA row is spread across 4 threads
+
+                # Each MMA row is spread across 4 lanes; butterfly-reduce.
                 tile_max = cute.arch.fmax(tile_max, cute.arch.shuffle_sync_bfly(tile_max, offset=2, mask=-1, mask_and_clamp=31))
                 tile_max = cute.arch.fmax(tile_max, cute.arch.shuffle_sync_bfly(tile_max, offset=1, mask=-1, mask_and_clamp=31))
 
                 new_rowmax = max(row_max[row], tile_max)
                 rescale = cute.math.exp(row_max[row] - new_rowmax)
 
-                # rescale previous O(row, :)
                 for ot in cutlass.range_constexpr(o_n_tiles):
                     for oi in cutlass.range_constexpr(o_n_atom):
                         acc_O[(oi, mi), mt, ot] *= rescale
                 row_sum[row] *= rescale
 
-                # exponentiate S(row, :) and accumulate row_sum
                 for nt in cutlass.range_constexpr(n_tiles):
                     for ni in cutlass.range_constexpr(n_atom):
                         p = cute.math.exp(acc_S[(ni, mi), mt, nt] - new_rowmax)
                         acc_S[(ni, mi), mt, nt] = p
                         row_sum[row] += p
-                
-                # update row_max
+
                 row_max[row] = new_rowmax
 
-            # -- load V --
             cute.copy(gmem_tiled_copy, tVgV[None, None, None, kv], tVsV)
             cute.arch.cp_async_commit_group()
             cute.arch.cp_async_wait_group(0)
             cute.arch.sync_threads()
 
-            # -- O += P @ V --
-            # TODO: fill in — 2nd MMA
-            # convert acc_S (float32) → fp16 fragment
             rP = cute.make_fragment_like(acc_S, mQ.element_type)
             rP.store(acc_S.load().to(mQ.element_type))
 
-            # reshape rP to match 2nd MMA A operand layout
             rP_layout_divided = cute.logical_divide(rP.layout, (None, None, 2))
             rP_mma_view = cute.make_layout(
                 (
@@ -337,9 +279,9 @@ class FlashAttnNaive:
             )
             tOrS = cute.make_tensor(rP.iterator, rP_mma_view)
 
-            # V transposed view for 2nd MMA B operand
-            # NOTE: composition only works with swizzled layouts; for row-major smem,
-            # we create a direct transposed view: sVt[i,j] = sV_base[j*HEAD_DIM + i]
+            # Direct transposed view: composition with Swizzle would be cleaner
+            # but only works for swizzled layouts, so for plain row-major we
+            # relabel the buffer as (HEAD_DIM, BLOCK_KV) with swapped strides.
             sVt = cute.make_tensor(sV.iterator, cute.make_layout((HEAD_DIM, BLOCK_KV), stride=(1, HEAD_DIM)))
             tOrVt = thr_mma.make_fragment_B(thr_mma.partition_B(sVt))
             tOsVt = smem_thr_copy_V.partition_S(sVt)
@@ -348,39 +290,33 @@ class FlashAttnNaive:
             for k in cutlass.range_constexpr(cute.size(tOrS.shape[2])):
                 cute.copy(smem_tiled_copy_V, tOsVt[None, None, k], tOrVt_copy_view[None, None, k])
                 cute.gemm(tiled_mma, acc_O, tOrS[None, None, k], tOrVt[None, None, k], acc_O)
-            
 
-        # ---- normalize and write output ----
-        # TODO: divide acc_O by row_sum, write to gO
+
         for row in cutlass.range_constexpr(cute.size(row_max)):
             mi = row % m_atom
             mt = row // m_atom
-            # quad reduction for row_sum before normalizing
             rs = row_sum[row]
             rs = rs + cute.arch.shuffle_sync_bfly(rs, offset=2, mask=-1, mask_and_clamp=31)
             rs = rs + cute.arch.shuffle_sync_bfly(rs, offset=1, mask=-1, mask_and_clamp=31)
             for ot in cutlass.range_constexpr(o_n_tiles):
                 for oi in cutlass.range_constexpr(o_n_atom):
                     acc_O[(oi, mi), mt, ot] /= rs
-        # convert acc_O to fp16
+
         rO = cute.make_fragment_like(acc_O, mQ.element_type)
         rO.store(acc_O.load().to(mQ.element_type))
 
-        # reuse sQ as output staging
+        # Reuse sQ as output staging
         sO = cute.make_tensor(sQ.iterator, sQ.layout)
 
-        # move mma accumulator to output staging
         smem_tiled_copy_O = cute.make_tiled_copy_C(smem_copy_atom, tiled_mma)
         smem_thr_copy_O = smem_tiled_copy_O.get_slice(tidx)
 
-        taccOrO = smem_thr_copy_O.retile(rO) # source: register fragment
-        taccOrsO = smem_thr_copy_O.partition_D(sO) # dest: shared view
+        taccOrO = smem_thr_copy_O.retile(rO)
+        taccOrsO = smem_thr_copy_O.partition_D(sO)
 
-        # use tiled copy object here
         cute.copy(smem_tiled_copy_O, taccOrO, taccOrsO)
         cute.arch.sync_threads()
 
-        # shared -> global store copy
         gmem_thr_store = gmem_tiled_store.get_slice(tidx)
 
         tOgsO = gmem_thr_store.partition_S(sO)
@@ -388,18 +324,15 @@ class FlashAttnNaive:
 
         cute.copy(gmem_tiled_store, tOgsO, tOgO)
 
-# ====================================================================
-# Launch harness: correctness + timing
-# ====================================================================
+
 def pytorch_reference(Q, K, V, scale):
     """Standard scaled dot-product attention in PyTorch (fp32 for reference)."""
-    # Q, K, V: [B, N, S, H]
     attn = torch.matmul(Q.float(), K.float().transpose(-2, -1)) * scale
     attn = F.softmax(attn, dim=-1)
     out = torch.matmul(attn, V.float())
     return out.to(Q.dtype)
- 
- 
+
+
 def run_flash_attn(B, N, Sq, Sk, H, dtype=torch.float16, num_warmup=5, num_iters=20):
     """
     B  = batch size
@@ -411,30 +344,26 @@ def run_flash_attn(B, N, Sq, Sk, H, dtype=torch.float16, num_warmup=5, num_iters
     assert H == HEAD_DIM, f"Head dim must be {HEAD_DIM}, got {H}"
     assert Sq % BLOCK_Q == 0, f"Sq={Sq} must be divisible by BLOCK_Q={BLOCK_Q}"
     assert Sk % BLOCK_KV == 0, f"Sk={Sk} must be divisible by BLOCK_KV={BLOCK_KV}"
- 
+
     torch.manual_seed(42)
     device = torch.device("cuda:0")
- 
-    # ---- allocate tensors ----
-    # Layout: [B, S, N, H] — contiguous, matches kernel's expectation
+
+    # Layout: [B, S, N, H], contiguous, matches kernel's expectation
     Q = torch.randn(B, Sq, N, H, dtype=dtype, device=device)
     K = torch.randn(B, Sk, N, H, dtype=dtype, device=device)
     V = torch.randn(B, Sk, N, H, dtype=dtype, device=device)
     O = torch.zeros(B, Sq, N, H, dtype=dtype, device=device)
- 
+
     scale = 1.0 / (H ** 0.5)
- 
-    # ---- get CUDA stream ----
+
     torch_stream = torch.cuda.current_stream()
     stream = cuda.CUstream(torch_stream.cuda_stream)
- 
-    # ---- wrap as CuTe tensors ----
+
     cQ = from_dlpack(Q, assumed_align=16)
     cK = from_dlpack(K, assumed_align=16)
     cV = from_dlpack(V, assumed_align=16)
     cO = from_dlpack(O, assumed_align=16)
- 
-    # ---- instantiate and compile kernel ----
+
     fa = FlashAttnNaive()
 
     print(f"Config: B={B}, N={N}, Sq={Sq}, Sk={Sk}, H={H}, dtype={dtype}")
@@ -447,7 +376,6 @@ def run_flash_attn(B, N, Sq, Sk, H, dtype=torch.float16, num_warmup=5, num_iters
     compiled_fa = cute.compile(fa, cQ, cK, cV, cO, scale, stream)
     print("  Compilation done.")
 
-    # ---- warmup ----
     print("Warming up...")
     for i in range(num_warmup):
         O.zero_()
@@ -456,42 +384,38 @@ def run_flash_attn(B, N, Sq, Sk, H, dtype=torch.float16, num_warmup=5, num_iters
         torch.cuda.synchronize()
     print(f"  {num_warmup} warmup iters done.")
     print()
- 
-    # ---- correctness check ----
+
     print("=" * 60)
     print("CORRECTNESS CHECK")
     print("=" * 60)
- 
+
     O.zero_()
     cO = from_dlpack(O, assumed_align=16)
     compiled_fa(cQ, cK, cV, cO, scale, stream)
     torch.cuda.synchronize()
- 
-    # PyTorch reference: expects [B, N, S, H]
-    Q_ref = Q.permute(0, 2, 1, 3)  # [B, N, Sq, H]
-    K_ref = K.permute(0, 2, 1, 3)  # [B, N, Sk, H]
-    V_ref = V.permute(0, 2, 1, 3)  # [B, N, Sk, H]
+
+    # PyTorch reference expects [B, N, S, H]
+    Q_ref = Q.permute(0, 2, 1, 3)
+    K_ref = K.permute(0, 2, 1, 3)
+    V_ref = V.permute(0, 2, 1, 3)
     O_ref = pytorch_reference(Q_ref, K_ref, V_ref, scale)
-    O_ref = O_ref.permute(0, 2, 1, 3)  # back to [B, Sq, N, H]
- 
-    # compare
+    O_ref = O_ref.permute(0, 2, 1, 3)
+
     abs_diff = (O.float() - O_ref.float()).abs()
     max_abs_err = abs_diff.max().item()
     mean_abs_err = abs_diff.mean().item()
- 
-    # relative error (avoid div-by-zero)
+
     denom = O_ref.float().abs().clamp(min=1e-6)
     rel_diff = abs_diff / denom
     max_rel_err = rel_diff.max().item()
     mean_rel_err = rel_diff.mean().item()
- 
-    # cosine similarity per-row
+
     O_flat = O.float().reshape(-1, H)
     O_ref_flat = O_ref.float().reshape(-1, H)
     cos_sim = F.cosine_similarity(O_flat, O_ref_flat, dim=-1)
     min_cos_sim = cos_sim.min().item()
     mean_cos_sim = cos_sim.mean().item()
- 
+
     print(f"  Max  absolute error: {max_abs_err:.6e}")
     print(f"  Mean absolute error: {mean_abs_err:.6e}")
     print(f"  Max  relative error: {max_rel_err:.6e}")
@@ -499,56 +423,50 @@ def run_flash_attn(B, N, Sq, Sk, H, dtype=torch.float16, num_warmup=5, num_iters
     print(f"  Min  cosine sim:     {min_cos_sim:.6f}")
     print(f"  Mean cosine sim:     {mean_cos_sim:.6f}")
     print()
- 
-    # pass/fail thresholds for fp16
+
     PASS = max_abs_err < 5e-2 and mean_cos_sim > 0.999
     print(f"  VERDICT: {'PASS ✓' if PASS else 'FAIL ✗'}")
     if not PASS:
-        # print a small slice for debugging
         print()
         print("  Sample output (first row, first head):")
         print(f"    Ours: {O[0, 0, 0, :8].tolist()}")
         print(f"    Ref:  {O_ref[0, 0, 0, :8].tolist()}")
     print()
- 
-    # ---- timing ----
+
     print("=" * 60)
     print("TIMING")
     print("=" * 60)
- 
-    # CUDA events for accurate GPU timing
+
     start_event = torch.cuda.Event(enable_timing=True)
     end_event = torch.cuda.Event(enable_timing=True)
- 
+
     times_ms = []
     for _ in range(num_iters):
         O.zero_()
         cO = from_dlpack(O, assumed_align=16)
         torch.cuda.synchronize()
- 
+
         start_event.record()
         compiled_fa(cQ, cK, cV, cO, scale, stream)
         end_event.record()
         torch.cuda.synchronize()
- 
+
         times_ms.append(start_event.elapsed_time(end_event))
- 
+
     times_ms.sort()
-    # drop top/bottom 20% for stability
+    # Drop top/bottom 20% for stability
     trim = max(1, num_iters // 5)
     trimmed = times_ms[trim:-trim] if len(times_ms) > 2 * trim else times_ms
- 
+
     avg_ms = sum(trimmed) / len(trimmed)
     min_ms = times_ms[0]
     max_ms = times_ms[-1]
     med_ms = times_ms[num_iters // 2]
- 
-    # compute throughput
-    # FLOPs for attention: 2 * B * N * Sq * Sk * H (for QK^T) + 2 * B * N * Sq * Sk * H (for PV)
-    # simplified: 4 * B * N * Sq * Sk * H
+
+    # Attention FLOPs: 2 * B*N*Sq*Sk*H for QK^T + 2 * B*N*Sq*Sk*H for PV
     total_flops = 4 * B * N * Sq * Sk * H
     tflops = (total_flops / (avg_ms / 1000)) / 1e12
- 
+
     print(f"  Iters:    {num_iters}")
     print(f"  Min:      {min_ms:.3f} ms")
     print(f"  Max:      {max_ms:.3f} ms")
@@ -556,21 +474,19 @@ def run_flash_attn(B, N, Sq, Sk, H, dtype=torch.float16, num_warmup=5, num_iters
     print(f"  Mean:     {avg_ms:.3f} ms  (trimmed)")
     print(f"  TFLOP/s:  {tflops:.2f}")
     print()
- 
-    # ---- PyTorch SDPA comparison ----
+
     print("=" * 60)
     print("PyTorch SDPA (F.scaled_dot_product_attention) comparison")
     print("=" * 60)
- 
-    Q_sdpa = Q.permute(0, 2, 1, 3).contiguous()  # [B, N, Sq, H]
+
+    Q_sdpa = Q.permute(0, 2, 1, 3).contiguous()
     K_sdpa = K.permute(0, 2, 1, 3).contiguous()
     V_sdpa = V.permute(0, 2, 1, 3).contiguous()
- 
-    # warmup
+
     for _ in range(num_warmup):
         _ = F.scaled_dot_product_attention(Q_sdpa, K_sdpa, V_sdpa, scale=scale)
     torch.cuda.synchronize()
- 
+
     sdpa_times = []
     for _ in range(num_iters):
         torch.cuda.synchronize()
@@ -579,17 +495,17 @@ def run_flash_attn(B, N, Sq, Sk, H, dtype=torch.float16, num_warmup=5, num_iters
         end_event.record()
         torch.cuda.synchronize()
         sdpa_times.append(start_event.elapsed_time(end_event))
- 
+
     sdpa_times.sort()
     sdpa_trimmed = sdpa_times[trim:-trim] if len(sdpa_times) > 2 * trim else sdpa_times
     sdpa_avg = sum(sdpa_trimmed) / len(sdpa_trimmed)
     sdpa_tflops = (total_flops / (sdpa_avg / 1000)) / 1e12
- 
+
     print(f"  Mean:     {sdpa_avg:.3f} ms  (trimmed)")
     print(f"  TFLOP/s:  {sdpa_tflops:.2f}")
     print(f"  Ours vs SDPA: {avg_ms / sdpa_avg:.2f}x slower")
     print()
- 
+
     return {
         "pass": PASS,
         "max_abs_err": max_abs_err,
@@ -599,38 +515,24 @@ def run_flash_attn(B, N, Sq, Sk, H, dtype=torch.float16, num_warmup=5, num_iters
         "our_tflops": tflops,
         "sdpa_tflops": sdpa_tflops,
     }
- 
- 
+
+
 if __name__ == "__main__":
     print("=" * 60)
-    print("Flash Attention v2 — Naive CuteDSL (v1)")
+    print("Flash Attention v2: Naive CuteDSL")
     print("=" * 60)
     print()
- 
-    # Small test first
+
     results = run_flash_attn(
-        B=2,       # batch
-        N=4,       # heads
-        Sq=256,    # query seq len
-        Sk=256,    # kv seq len
-        H=128,     # head dim
-        dtype=torch.float16,
-        num_warmup=5,
-        num_iters=20,
+        B=2, N=4, Sq=256, Sk=256, H=128,
+        dtype=torch.float16, num_warmup=5, num_iters=20,
     )
- 
+
     if results["pass"]:
         print()
         print("Small test passed! Running larger benchmark...")
         print()
         run_flash_attn(
-            B=2,
-            N=8,
-            Sq=1024,
-            Sk=1024,
-            H=128,
-            dtype=torch.float16,
-            num_warmup=5,
-            num_iters=50,
+            B=2, N=8, Sq=1024, Sk=1024, H=128,
+            dtype=torch.float16, num_warmup=5, num_iters=50,
         )
- 
