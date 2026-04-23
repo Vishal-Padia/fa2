@@ -180,7 +180,7 @@ cp_atom = cute.make_copy_atom(
     mQ.element_type,
     num_bits_per_copy=128,  # 8 fp16 elements per thread per instruction
 )
-```Fix 
+``` 
 
 Second, describe how threads are laid out across the tile:
 
