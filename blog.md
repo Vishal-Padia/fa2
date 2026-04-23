@@ -4,7 +4,7 @@ After writing [Flash Attention 1](https://www.lowlevelml.com/blog/flash-attentio
 
 Spoiler: I did not beat PyTorch SDPA. I got close, and along the way I learned a lot about where my mental model of GPU optimization was wrong. The failed optimizations are in here too, because those were the ones I actually learned from.
 
-> 💡 **Thanks** to [Sriram](https://x.com/s_gowindone) for getting me into GPU work in the first place and patiently unblocking me whenever something made no sense, [GPU Mode](https://x.com/GPU_MODE) for the lectures and the community that makes kernels feel approachable, and [Gau Nernst](https://x.com/gaunernst), whose [FA on the 5090 post](https://gau-nernst.github.io/fa-5090/) was the one which gave me an idea to try this out. So a huge thanks to everyone
+> 💡 **Thanks** to [Sriram](https://x.com/s_gowindone) for getting me into GPU work in the first place and patiently unblocking me whenever something made no sense, [GPU Mode](https://x.com/GPU_MODE) for the lectures and the community that makes kernels feel approachable, and [Gau Nernst](https://x.com/gaunernst), whose [FA on the 5090 post](https://gau-nernst.github.io/fa-5090/) is what gave me the idea to try this in the first place. Huge thanks to everyone.
 
 What we'll do in this post:
 
@@ -20,13 +20,13 @@ What we'll do in this post:
 The running perf table:
 
 
-| Version                  | 1024x1024, B=2, N=8, H=128 | TFLOP/s   | vs SDPA          | Key change                                          |
-| ------------------------ | -------------------------- | --------- | ---------------- | --------------------------------------------------- |
-| Naive CuteDSL            | 0.417 ms                   | 20.61     | 2.02x slower     | baseline                                            |
-| + Pipelining             | 0.352 ms                   | 24.41     | 1.70x slower     | double-buffer K so cp.async overlaps MMA (broken V) |
-| + Swizzle (no pipeline)  | 0.308 ms                   | 27.93     | 1.48x slower     | swizzled smem layout, kills bank conflicts          |
-| + LDMatrix (on swizzle)  | **0.268 ms**               | **32.01** | **1.30x slower** | actual `ldmatrix.sync` instead of generic smem copy |
-| PyTorch SDPA (reference) | 0.207 ms                   | 41.55     | 1.00x            |                                                     |
+| Version                  | 1024x1024, B=2, N=8, H=128 | TFLOP/s   | vs SDPA          | Key change                                                    |
+| ------------------------ | -------------------------- | --------- | ---------------- | ------------------------------------------------------------- |
+| Naive CuteDSL            | 0.417 ms                   | 20.61     | 2.02x slower     | baseline                                                      |
+| + Pipelining + Swizzle   | 0.352 ms                   | 24.41     | 1.70x slower     | K double-buffer on top of a swizzled layout (V buffer broken) |
+| + Swizzle (no pipeline)  | 0.308 ms                   | 27.93     | 1.48x slower     | swizzled smem layout alone, kills bank conflicts              |
+| + LDMatrix (on swizzle)  | **0.268 ms**               | **32.01** | **1.30x slower** | actual `ldmatrix.sync` instead of generic smem copy           |
+| PyTorch SDPA (reference) | 0.207 ms                   | 41.55     | 1.00x            |                                                               |
 
 
 Benchmarked on an A10G (sm_86), fp16 inputs, fp32 accumulator.
@@ -123,11 +123,11 @@ One threadblock per `(batch, head, q_tile)`. Each block:
 
 1. Loads its `Q` tile from HBM into shared memory once.
 2. Loops over all `KV` tiles. For each:
-  - Async-copy `K` into shared memory.
-  - Compute `S = Q @ K^T` into register-resident fp32 accumulators.
-  - Scale by `1/√D`, update the online softmax, rescale `O_accum`.
-  - Async-copy `V` into shared memory.
-  - Compute `O += P @ V` where `P = softmax(S)` cast back to fp16.
+   - Async-copy `K` into shared memory.
+   - Compute `S = Q @ K^T` into register-resident fp32 accumulators.
+   - Scale by `1/√D`, update the online softmax, rescale `O_accum`.
+   - Async-copy `V` into shared memory.
+   - Compute `O += P @ V` where `P = softmax(S)` cast back to fp16.
 3. Divide `O` by the running sum `l`, cast to fp16, store back to HBM.
 
 Concretely:
@@ -180,7 +180,7 @@ cp_atom = cute.make_copy_atom(
     mQ.element_type,
     num_bits_per_copy=128,  # 8 fp16 elements per thread per instruction
 )
-```
+```Fix 
 
 Second, describe how threads are laid out across the tile:
 
@@ -280,14 +280,16 @@ for kv in range(num_kv_tiles):
 Two things are worth noting even at this naive stage:
 
 1. **Every copy is followed by a full `cp_async_wait_group(0)` and `sync_threads()`.** No overlap, the MMA waits for the copy, then the copy waits for the MMA. This will be the target of the pipelining attempt.
-2. `**V` has to be transposed for the second GEMM.** The MMA wants the `B` operand column-major, but we stored `V` row-major. We cheat:
-  ```python
-   sVt = cute.make_tensor(
-       sV.iterator,
-       cute.make_layout((HEAD_DIM, BLOCK_KV), stride=(1, HEAD_DIM)),
-   )
-  ```
-   Same underlying buffer, swapped shape and stride. No data movement, just a relabelling.
+2. **`V` has to be transposed for the second GEMM.** The MMA wants the `B` operand column-major, but we stored `V` row-major. We cheat:
+
+    ```python
+    sVt = cute.make_tensor(
+        sV.iterator,
+        cute.make_layout((HEAD_DIM, BLOCK_KV), stride=(1, HEAD_DIM)),
+    )
+    ```
+
+    Same underlying buffer, swapped shape and stride. No data movement, just a relabelling.
 
 ### 4.7 The online softmax, per-thread
 
@@ -585,18 +587,18 @@ Final table:
 | Version                 | 1024x1024 | TFLOP/s | vs SDPA      |
 | ----------------------- | --------- | ------- | ------------ |
 | Naive CuteDSL           | 0.417 ms  | 20.61   | 2.02x slower |
-| + Pipelining (broken)   | 0.352 ms  | 24.41   | 1.70x slower |
+| + Pipelining + Swizzle  | 0.352 ms  | 24.41   | 1.70x slower |
 | + Swizzle (no pipeline) | 0.308 ms  | 27.93   | 1.48x slower |
 | + LDMatrix (on swizzle) | 0.268 ms  | 32.01   | 1.30x slower |
 | PyTorch SDPA            | 0.207 ms  | 41.55   | 1.00x        |
 
 
-We got from 2x slower to 1.30x slower. Not bad for a someone who still trying to figure out things, and frankly I was not going to beat SDPA. PyTorch's SDPA on sm_86 dispatches to Flash Attention 2 underneath, with code tuned by people who have forgotten more about CuTe than I currently know. The remaining 1.30x is, I think, a mix of:
+We got from 2x slower to 1.30x slower. Not bad for someone who's still figuring things out, and frankly I was not going to beat SDPA. PyTorch's SDPA on sm_86 dispatches to Flash Attention 2 underneath, with code tuned by people who have forgotten more about CuTe than I currently know. The remaining 1.30x is, I think, a mix of:
 
 - **My tile shapes aren't ideal.** BLOCK_Q=64, BLOCK_KV=64 is a safe choice, but larger tiles amortize the prologue and expose more parallelism per block. I'd want to sweep at least `{64, 128} x {64, 128}` and probably push BLOCK_KV up.
 - **I never got pipelining to work.** That's real throughput left on the table, and it's what the "89% no eligible" -> "35%" improvement hinted at. Getting to 10% or lower requires actual overlap of cp.async with MMA.
 - **168 registers per thread is high.** The accumulators eat most of it. A smarter layout (or WGMMA on Hopper, not available here) would use fewer.
-- **Bare honesty: my CuteDSL fluency is still limited.** I can recognize what the profile is telling me, but I can't always translate "I need this thing to happen" into the right `make_tiled_copy_B` / `retile` / `partition_`* incantation on the first try. More reps required.
+- **Bare honesty: my CuteDSL fluency is still limited.** I can recognize what the profile is telling me, but I can't always translate "I need this thing to happen" into the right `make_tiled_copy_B` / `retile` / `partition_*` incantation on the first try. More reps required.
 
 So: couldn't beat SDPA, got within 30%, learned a lot more from what didn't work than what did.
 
